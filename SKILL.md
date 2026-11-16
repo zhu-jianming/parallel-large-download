@@ -3,6 +3,7 @@ name: parallel-large-download
 description: Download very large files (multi-GB) over slow, per-connection-throttled or unstable links with parallel HTTP range chunks, resume, connection refresh, remote sample verification and checksum-guided repair. Use when a download from Zenodo/CERN or any slow host crawls, stalls, drops, or must be verified and repaired; also for 加速下载, 并行下载, 断点续传, 大文件校验/修复.
 metadata:
   version: "1.0.0"
+  license: MIT
 ---
 
 # Parallel large-file download

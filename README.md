@@ -77,6 +77,9 @@ Start-ScheduledTask -TaskName 'MyDownload'
 - Security software may flag the pattern "hidden process spawns many network clients plus a scheduled task" as suspicious. Prefer `-NoNewWindow`, keep the scripts in a folder you exclude from real-time scanning, and review the code — it is plain PowerShell.
 - Progress reported by Explorer or `Get-ChildItem` is unreliable for files a process holds open; the scripts read sizes with `Get-Item`.
 - A size match is not integrity. Always compare the publisher checksum.
-- No license is declared in this repository; add one if you intend to redistribute.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 See `SKILL.md` for the full workflow and the hard-won rules.
