@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][int64]$TotalSize,
     [string]$Dest = '.',
     [string]$OutName = 'download.bin',
-    [int]$Parts = 48,
+    [int]$ChunkMB = 128,
+    [int]$Workers = 48,
     [string]$Proxy = '',
     [string]$Md5 = '',
     [string]$Curl = 'C:\Windows\System32\curl.exe',
@@ -11,12 +12,17 @@ param(
     [int]$StallKillSeconds = 900
 )
 
-# Parallel HTTP range downloader: one part file per range, curl per part through a
-# supervisor loop, append-on-exit (never curl --retry with -o), keep-alive refresh
-# via MaxTimeSeconds, assemble in order, verify size and optional MD5.
+# Work-stealing parallel HTTP range downloader.
+# The file is cut into fixed-size chunks (ChunkMB); a pool of Workers keeps that many
+# curls in flight and any finishing worker immediately takes the next queued chunk,
+# so one slow connection cannot leave the tail of the file stranded. Each chunk is a
+# resume point: a restart picks up at that chunk's current byte length.
 
 $ErrorActionPreference = 'Stop'
 if (-not (Test-Path -LiteralPath $Curl)) { throw "curl not found: $Curl" }
+if ($ChunkMB -lt 1) { throw 'ChunkMB must be >= 1' }
+if ($Workers -lt 1) { throw 'Workers must be >= 1' }
+
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 $PartsDir = Join-Path $Dest '_parts'
 New-Item -ItemType Directory -Force -Path $PartsDir | Out-Null
@@ -28,12 +34,12 @@ function Write-Log([string]$Message) {
     Add-Content -LiteralPath $LogFile -Value ('[{0:yyyy-MM-dd HH:mm:ss}] {1}' -f (Get-Date), $Message) -Encoding utf8
 }
 
-function Add-Tmp([string]$PartFile) {
-    $tmp = $PartFile + '.tmp'
+function Add-Tmp([string]$ChunkFile) {
+    $tmp = $ChunkFile + '.tmp'
     if (Test-Path -LiteralPath $tmp) {
         $len = (Get-Item -LiteralPath $tmp).Length
         if ($len -gt 0) {
-            $out = [System.IO.File]::Open($PartFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
+            $out = [System.IO.File]::Open($ChunkFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
             try { $src = [System.IO.File]::OpenRead($tmp); try { $src.CopyTo($out, 1MB) } finally { $src.Dispose() } }
             finally { $out.Dispose() }
         }
@@ -41,69 +47,77 @@ function Add-Tmp([string]$PartFile) {
     }
 }
 
-$chunk = [int64]([math]::Floor([double]$TotalSize / $Parts) + 1)
+$chunkBytes = [int64]$ChunkMB * 1MB
+$count = [int]([math]::Ceiling([double]$TotalSize / $chunkBytes))
 $plan = @()
-for ($i = 0; $i -lt $Parts; $i++) {
-    $start = [int64]$i * $chunk
-    if ($start -ge $TotalSize) { break }
-    $end = [math]::Min($start + $chunk - 1, $TotalSize - 1)
+for ($i = 0; $i -lt $count; $i++) {
+    $start = [int64]$i * $chunkBytes
+    $end = [math]::Min($start + $chunkBytes - 1, $TotalSize - 1)
     $plan += [pscustomobject]@{
         I = $i; Start = $start; End = $end; Size = [int64]($end - $start + 1)
-        File = (Join-Path $PartsDir ('part_{0:D3}.bin' -f $i))
+        File = (Join-Path $PartsDir ('chunk_{0:D5}.bin' -f $i))
     }
 }
 
-# merge leftovers from an interrupted run so nothing is re-downloaded
 foreach ($p in $plan) { Add-Tmp $p.File }
-Write-Log ("START total={0} parts={1} chunk={2} url={3} proxy={4}" -f $TotalSize, $plan.Count, $chunk, $Url, $(if ($Proxy) { $Proxy } else { '(direct)' }))
+Write-Log ("START total={0} chunks={1} chunkBytes={2} workers={3} url={4} proxy={5}" -f $TotalSize, $count, $chunkBytes, $Workers, $Url, $(if ($Proxy) { $Proxy } else { '(direct)' }))
 
-$procs = @{}; $seen = @{}; $moved = @{}; $starts = @{}; $done = @{}
-foreach ($p in $plan) { $seen[$p.I] = [int64]0; $moved[$p.I] = Get-Date; $starts[$p.I] = 0 }
+$queue = [System.Collections.Generic.Queue[int]]::new()
+foreach ($p in $plan) {
+    $have = [int64]0
+    if (Test-Path -LiteralPath $p.File) { $have = (Get-Item -LiteralPath $p.File).Length }
+    if ($have -lt $p.Size) { $queue.Enqueue($p.I) }
+}
+Write-Log ("resume: {0} of {1} chunks pending" -f $queue.Count, $count)
+
+$active = @{}
+$seen = @{}
+$moved = @{}
+$finished = @{}
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $baseBytes = [int64]0
 foreach ($p in $plan) { if (Test-Path -LiteralPath $p.File) { $baseBytes += (Get-Item -LiteralPath $p.File).Length } }
 $lastReport = [datetime]::MinValue
 
-while ($true) {
-    $allDone = $true
-    foreach ($p in $plan) {
-        $cur = [int64]0
-        if (Test-Path -LiteralPath $p.File) { $cur = (Get-Item -LiteralPath $p.File).Length }
-        if ($cur -ge $p.Size) {
-            if (-not $done.ContainsKey($p.I)) { $done[$p.I] = $true; Write-Log ("part {0} complete" -f $p.I) }
-            continue
-        }
-        $allDone = $false
+while ($queue.Count -gt 0 -or $active.Count -gt 0) {
+    while ($active.Count -lt $Workers -and $queue.Count -gt 0) {
+        $index = $queue.Dequeue()
+        $p = $plan[$index]
+        $have = [int64]0
+        if (Test-Path -LiteralPath $p.File) { $have = (Get-Item -LiteralPath $p.File).Length }
+        if ($have -ge $p.Size) { continue }
         $tmp = $p.File + '.tmp'
-        $proc = $procs[$p.I]
-        if ($proc) {
-            $proc.Refresh()
-            if (-not $proc.HasExited) {
-                $tmpSize = [int64]0
-                if (Test-Path -LiteralPath $tmp) { $tmpSize = (Get-Item -LiteralPath $tmp).Length }
-                if ($tmpSize -ne $seen[$p.I]) { $seen[$p.I] = $tmpSize; $moved[$p.I] = Get-Date }
-                elseif (((Get-Date) - $moved[$p.I]).TotalSeconds -gt $StallKillSeconds) {
-                    Write-Log ("part {0} stalled {1}s, restarting curl" -f $p.I, [int]$StallKillSeconds)
-                    try { $proc.Kill() } catch { }
-                }
-                continue
-            }
-            Add-Tmp $p.File
-            $procs.Remove($p.I)
-            $seen[$p.I] = 0; $moved[$p.I] = Get-Date
-            if (Test-Path -LiteralPath $p.File) { $cur = (Get-Item -LiteralPath $p.File).Length }
-            if ($cur -ge $p.Size -and -not $done.ContainsKey($p.I)) { $done[$p.I] = $true; Write-Log ("part {0} complete" -f $p.I) }
-        }
-        if ($cur -ge $p.Size) { continue }
-        if ($starts[$p.I] -ge 200) { Write-Log ("part {0}: too many restarts, giving up" -f $p.I); continue }
-        $from = $p.Start + $cur
-        $args = @('-sS', '-L', '--connect-timeout', '30', '--max-time', $MaxTimeSeconds, '--range', ("{0}-{1}" -f $from, $p.End), '-o', $tmp)
+        $args = @('-sS', '-L', '--connect-timeout', '30', '--max-time', $MaxTimeSeconds,
+                  '--range', ("{0}-{1}" -f ($p.Start + $have), $p.End), '-o', $tmp)
         if ($Proxy) { $args += @('-x', $Proxy) }
         $args += $Url
-        $procs[$p.I] = Start-Process -FilePath $Curl -ArgumentList $args -PassThru -NoNewWindow
-        $starts[$p.I] = $starts[$p.I] + 1
-        $moved[$p.I] = Get-Date
+        $active[$index] = Start-Process -FilePath $Curl -ArgumentList $args -PassThru -NoNewWindow
+        $seen[$index] = [int64]0
+        $moved[$index] = Get-Date
+    }
+
+    foreach ($index in @($active.Keys)) {
+        $proc = $active[$index]
+        $p = $plan[$index]
+        $tmp = $p.File + '.tmp'
+        $proc.Refresh()
+        if (-not $proc.HasExited) {
+            $tmpSize = [int64]0
+            if (Test-Path -LiteralPath $tmp) { $tmpSize = (Get-Item -LiteralPath $tmp).Length }
+            if ($tmpSize -ne $seen[$index]) { $seen[$index] = $tmpSize; $moved[$index] = Get-Date }
+            elseif (((Get-Date) - $moved[$index]).TotalSeconds -gt $StallKillSeconds) {
+                Write-Log ("chunk {0} stalled, restarting" -f $index)
+                try { $proc.Kill() } catch { }
+            }
+            continue
+        }
+        Add-Tmp $p.File
+        $active.Remove($index)
+        $have = [int64]0
+        if (Test-Path -LiteralPath $p.File) { $have = (Get-Item -LiteralPath $p.File).Length }
+        if ($have -lt $p.Size) { $queue.Enqueue($index) }
+        elseif (-not $finished.ContainsKey($index)) { $finished[$index] = $true; Write-Log ("chunk {0} complete" -f $index) }
     }
 
     if (((Get-Date) - $lastReport).TotalSeconds -ge 30) {
@@ -116,16 +130,15 @@ while ($true) {
         $elapsed = [math]::Max(1, $sw.Elapsed.TotalSeconds)
         $rate = ($bytes - $baseBytes) / $elapsed / 1MB
         $eta = if ($rate -gt 0) { [TimeSpan]::FromSeconds((($TotalSize - $bytes) / 1MB) / $rate) } else { [TimeSpan]::Zero }
-        $line = '{0} / {1} ({2:P1})  this-run {3:N2} MB/s  eta {4:hh\:mm\:ss}' -f ($bytes/1GB), ($TotalSize/1GB), ($bytes/$TotalSize), $rate, $eta
+        $line = '{0:N2} / {1:N2} GiB ({2:P1})  run {3:N2} MB/s  active {4}  queued {5}  elapsed {6:hh\:mm\:ss}  eta {7:hh\:mm\:ss}' -f ($bytes/1GB), ($TotalSize/1GB), ($bytes/$TotalSize), $rate, $active.Count, $queue.Count, $sw.Elapsed, $eta
         Set-Content -LiteralPath $ProgFile -Value $line -Encoding utf8
         Write-Log $line
         $lastReport = Get-Date
     }
-    if ($allDone) { break }
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds 1500
 }
 
-Write-Log 'all parts complete; assembling'
+Write-Log 'all chunks complete; assembling'
 $outStream = [System.IO.File]::Open($Out, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
 try {
     foreach ($p in $plan) {
@@ -150,4 +163,3 @@ if ($Md5) {
     Set-Content -LiteralPath $ProgFile -Value ("DONE size={0} md5=unchecked" -f $finalSize) -Encoding utf8
 }
 Write-Log 'ALL DONE'
-

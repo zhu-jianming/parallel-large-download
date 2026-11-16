@@ -1,8 +1,8 @@
 # parallel-large-download
 
-A DeepSeek Harness skill for pulling multi-gigabyte files over slow, throttled or unstable links — parallel HTTP range chunks, resume, periodic connection refresh, remote sample verification and checksum-guided repair.
+A DeepSeek Harness skill for pulling multi-gigabyte files over slow, throttled or unstable links — work-stealing HTTP range chunks, resume, periodic connection refresh, remote sample verification and checksum-guided repair.
 
-This is the workflow that completed a 72 GiB Zenodo object in about 6 hours over a per-connection-throttled route, packaged with the failure modes that cost the most time.
+Same mechanism as NDM/IDM/aria2 (many `Range` connections), with two differences that matter at this scale: a free worker immediately takes the next queued chunk so one slow connection cannot strand the tail of the file, and the finished bytes are verified and repaired instead of trusted.
 
 ## What it solves
 
@@ -15,7 +15,7 @@ This is the workflow that completed a 72 GiB Zenodo object in about 6 hours over
 
 - Windows 10/11 with PowerShell 7 (`pwsh`)
 - `curl.exe` (ships with Windows) — or pass `-Curl` to another build
-- Enough free disk for the file plus its part files (about 2×)
+- Enough free disk for the file plus its chunk files (about 2×)
 
 ## Install
 
@@ -32,25 +32,26 @@ The skill provider discovers `<root>/<name>/SKILL.md` and watches the directory,
 
 ## Usage
 
-Measure first — direct versus proxy, and how many connections the route rewards:
+Tune the connection count against the real URL (sweeps 1..96 by default, recommends a `-Workers` value):
 
 ```powershell
-pwsh -File scripts/probe.ps1 -Url <file-url> -Proxy 'http://127.0.0.1:<port>' -Connections 1,8,24,48
+pwsh -File scripts/tune.ps1 -Url <file-url> -Proxy 'http://127.0.0.1:<port>' -Connections 1,8,16,32,48,64,96
 ```
 
 Download with resume and a publisher checksum:
 
 ```powershell
 pwsh -File scripts/download.ps1 -Url <file-url> -TotalSize <bytes> `
-  -Dest 'D:\data\thing' -OutName 'thing.zip' -Parts 48 `
+  -Dest 'D:\data\thing' -OutName 'thing.zip' `
+  -ChunkMB 128 -Workers 48 `
   -Proxy 'http://127.0.0.1:<port>' -Md5 <expected-md5>
 ```
 
-Verify every part against the remote object, repair only the bad ranges, then re-check:
+Verify every chunk against the remote object, repair only the bad ranges, then re-check:
 
 ```powershell
-pwsh -File scripts/verify.ps1 -Url <file-url> -TotalSize <bytes> -Dest 'D:\data\thing' -OutName 'thing.zip'
-pwsh -File scripts/repair.ps1 -Url <file-url> -TotalSize <bytes> -Index <n> -Dest 'D:\data\thing' -OutName 'thing.zip'
+pwsh -File scripts/verify.ps1 -Url <file-url> -TotalSize <bytes> -Dest 'D:\data\thing' -OutName 'thing.zip' -ChunkMB 128
+pwsh -File scripts/repair.ps1 -Url <file-url> -TotalSize <bytes> -Index <n> -Dest 'D:\data\thing' -OutName 'thing.zip' -ChunkMB 128
 ```
 
 Keep a long download alive across agent restarts with a scheduled task, and optionally a watchdog:
@@ -66,15 +67,15 @@ Start-ScheduledTask -TaskName 'MyDownload'
 
 | Script | Purpose |
 |---|---|
-| `scripts/probe.ps1` | Throughput probe: direct vs proxy, 1..N connections |
-| `scripts/download.ps1` | Parallel ranged download with resume, connection refresh, assembly, MD5 |
-| `scripts/verify.ps1` | Sample-compare every part with the remote object; list bad parts |
-| `scripts/repair.ps1` | Re-download one range in parallel and replace the part or splice the output |
+| `scripts/tune.ps1` | Sweep connection counts and recommend a worker count |
+| `scripts/download.ps1` | Work-stealing parallel ranged download with resume, connection refresh, assembly, MD5 |
+| `scripts/verify.ps1` | Sample-compare every chunk with the remote object; list bad chunks |
+| `scripts/repair.ps1` | Re-download one chunk in parallel and replace it or splice the output |
 | `scripts/watchdog.ps1` | Restart a dead or stalled download task; never touches assembly/hashing |
 
 ## Notes and caveats
 
-- Security software may flag the pattern "hidden process spawns many network clients plus a scheduled task" as suspicious. Prefer `-NoNewWindow`, keep the scripts in a folder you exclude from real-time scanning, and review the code — it is plain PowerShell.
+- Security software may flag the pattern "long-running process spawns many network clients plus a scheduled task" as suspicious. Prefer `-NoNewWindow`, keep the scripts in a folder you exclude from real-time scanning, and review the code — it is plain PowerShell.
 - Progress reported by Explorer or `Get-ChildItem` is unreliable for files a process holds open; the scripts read sizes with `Get-Item`.
 - A size match is not integrity. Always compare the publisher checksum.
 

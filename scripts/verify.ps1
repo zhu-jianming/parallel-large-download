@@ -3,52 +3,48 @@ param(
     [Parameter(Mandatory = $true)][int64]$TotalSize,
     [string]$Dest = '.',
     [string]$OutName = 'download.bin',
-    [int]$Parts = 48,
+    [int]$ChunkMB = 128,
     [string]$Proxy = '',
     [int]$SampleBytes = 65536,
-    [int]$Samples = 6,
-    [double[]]$Fractions = @(),
+    [int]$Samples = 2,
     [int]$Retries = 4,
     [string]$Curl = 'C:\Windows\System32\curl.exe'
 )
 
-# Compare sampled windows of every part with the remote object at the same absolute
-# offset. A part with duplicated/shifted bytes keeps its exact size, so content
-# comparison is the only way to find it. Probes are sequential: bursty parallel
-# probes make some hosts answer with tiny error bodies.
+# Compare sampled windows of every chunk with the remote object at the same absolute
+# offset. A chunk with duplicated or shifted bytes keeps its exact size, so only
+# content comparison finds it. Probes are sequential: bursty parallel probes make
+# some hosts answer with tiny error bodies.
 
 $ErrorActionPreference = 'Stop'
 $PartsDir = Join-Path $Dest '_parts'
 $Report   = Join-Path $Dest ($OutName + '.verify.log')
-$BadFile  = Join-Path $Dest ($OutName + '.badparts.txt')
+$BadFile  = Join-Path $Dest ($OutName + '.badchunks.txt')
 
-if (-not (Test-Path -LiteralPath $PartsDir)) { throw "no parts directory: $PartsDir" }
+if (-not (Test-Path -LiteralPath $PartsDir)) { throw "no chunks directory: $PartsDir" }
 Set-Content -LiteralPath $Report -Value ('[{0:yyyy-MM-dd HH:mm:ss}] verify start' -f (Get-Date)) -Encoding utf8
 
-$chunk = [int64]([math]::Floor([double]$TotalSize / $Parts) + 1)
+$chunkBytes = [int64]$ChunkMB * 1MB
+$count = [int]([math]::Ceiling([double]$TotalSize / $chunkBytes))
+$points = [System.Collections.Generic.List[double]]::new()
+$points.Add(0.001)
+$points.Add(0.999)
+for ($s = 0; $s -lt $Samples; $s++) { $points.Add(($s + 0.5) / $Samples) }
+$fractions = $points.ToArray()
+
 $bad = @()
-
-if ($Fractions.Count -eq 0) {
-    $points = [System.Collections.Generic.List[double]]::new()
-    $points.Add(0.001)
-    $points.Add(0.999)
-    for ($s = 0; $s -lt $Samples; $s++) { $points.Add(($s + 0.5) / $Samples) }
-    $Fractions = $points.ToArray()
-}
-
-for ($i = 0; $i -lt $Parts; $i++) {
-    $start = [int64]$i * $chunk
-    if ($start -ge $TotalSize) { break }
-    $end  = [math]::Min($start + $chunk - 1, $TotalSize - 1)
+for ($i = 0; $i -lt $count; $i++) {
+    $start = [int64]$i * $chunkBytes
+    $end = [math]::Min($start + $chunkBytes - 1, $TotalSize - 1)
     $size = [int64]($end - $start + 1)
-    $file = Join-Path $PartsDir ('part_{0:D3}.bin' -f $i)
-    if (-not (Test-Path -LiteralPath $file)) { $bad += $i; Add-Content -LiteralPath $Report -Value ("part {0}: missing" -f $i) -Encoding utf8; continue }
-    if ((Get-Item -LiteralPath $file).Length -ne $size) { $bad += $i; Add-Content -LiteralPath $Report -Value ("part {0}: wrong size" -f $i) -Encoding utf8; continue }
+    $file = Join-Path $PartsDir ('chunk_{0:D5}.bin' -f $i)
+    if (-not (Test-Path -LiteralPath $file)) { $bad += $i; Add-Content -LiteralPath $Report -Value ("chunk {0}: missing" -f $i) -Encoding utf8; continue }
+    if ((Get-Item -LiteralPath $file).Length -ne $size) { $bad += $i; Add-Content -LiteralPath $Report -Value ("chunk {0}: wrong size" -f $i) -Encoding utf8; continue }
 
     $fs = [System.IO.File]::OpenRead($file)
     $problems = @()
     try {
-        foreach ($fraction in $Fractions) {
+        foreach ($fraction in $fractions) {
             $offset = [int64]([math]::Floor($size * $fraction))
             if ($offset + $SampleBytes -gt $size) { continue }
             $absolute = $start + $offset
@@ -78,13 +74,13 @@ for ($i = 0; $i -lt $Parts; $i++) {
 
     if ($problems.Count -gt 0) {
         $bad += $i
-        Add-Content -LiteralPath $Report -Value ("part {0}: {1}" -f $i, ($problems -join '; ')) -Encoding utf8
+        Add-Content -LiteralPath $Report -Value ("chunk {0}: {1}" -f $i, ($problems -join '; ')) -Encoding utf8
     } else {
-        Add-Content -LiteralPath $Report -Value ("part {0}: ok" -f $i) -Encoding utf8
+        Add-Content -LiteralPath $Report -Value ("chunk {0}: ok" -f $i) -Encoding utf8
     }
 }
 
 Set-Content -LiteralPath $BadFile -Value ($bad -join ',') -Encoding utf8
-Add-Content -LiteralPath $Report -Value ('[{0:yyyy-MM-dd HH:mm:ss}] verify done; bad parts = {1}' -f (Get-Date), $(if ($bad.Count) { $bad -join ',' } else { 'none' })) -Encoding utf8
-"bad parts: " + $(if ($bad.Count) { $bad -join ',' } else { 'none' })
+Add-Content -LiteralPath $Report -Value ('[{0:yyyy-MM-dd HH:mm:ss}] verify done; bad chunks = {1}' -f (Get-Date), $(if ($bad.Count) { $bad -join ',' } else { 'none' })) -Encoding utf8
+"bad chunks: " + $(if ($bad.Count) { $bad -join ',' } else { 'none' })
 if ($bad.Count -gt 0) { exit 2 }

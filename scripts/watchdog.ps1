@@ -3,13 +3,13 @@ param(
     [Parameter(Mandatory = $true)][string]$Dest,
     [Parameter(Mandatory = $true)][int64]$TotalSize,
     [string]$OutName = 'download.bin',
-    [int]$Parts = 48,
+    [int]$ChunkMB = 128,
     [int]$StallMinutes = 15,
     [int]$CooldownMinutes = 30
 )
 
 # Restart a download whose supervisor died or stopped making progress.
-# Skips the assembly/hashing phase on purpose: parts stop growing there, and a
+# Skips the assembly/hashing phase on purpose: chunks stop growing there, and a
 # "stall" judgment would kill the checksum.
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -25,18 +25,16 @@ function Write-Log([string]$Message) {
 $progressText = Get-Content -LiteralPath $Progress -ErrorAction SilentlyContinue
 if ($progressText -match '^DONE|^FAIL') { exit 0 }
 
-$chunk = [int64]([math]::Floor([double]$TotalSize / $Parts) + 1)
+$chunkBytes = [int64]$ChunkMB * 1MB
+$count = [int]([math]::Ceiling([double]$TotalSize / $chunkBytes))
 $complete = 0
-$total = 0
-for ($i = 0; $i -lt $Parts; $i++) {
-    $start = [int64]$i * $chunk
-    if ($start -ge $TotalSize) { break }
-    $total++
-    $file = Join-Path $PartsDir ('part_{0:D3}.bin' -f $i)
-    $expected = [math]::Min($chunk, $TotalSize - $start)
+for ($i = 0; $i -lt $count; $i++) {
+    $start = [int64]$i * $chunkBytes
+    $expected = [math]::Min($chunkBytes, $TotalSize - $start)
+    $file = Join-Path $PartsDir ('chunk_{0:D5}.bin' -f $i)
     if ((Test-Path -LiteralPath $file) -and ((Get-Item -LiteralPath $file).Length -ge $expected)) { $complete++ }
 }
-if ($total -gt 0 -and $complete -eq $total) { exit 0 }
+if ($complete -eq $count) { exit 0 }
 
 $bytes = [int64]0
 foreach ($file in Get-ChildItem -LiteralPath $PartsDir -File -ErrorAction SilentlyContinue) {
@@ -79,5 +77,5 @@ if ($restarted) { $lastGrowth = $now }
     lastGrowth  = $lastGrowth.ToString('o')
     lastRestart = $lastRestart.ToString('o')
     complete    = $complete
-    total       = $total
+    total       = $count
 } | ConvertTo-Json -Compress) | Set-Content -LiteralPath $State -Encoding utf8

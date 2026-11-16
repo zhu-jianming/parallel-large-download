@@ -4,23 +4,23 @@ param(
     [Parameter(Mandatory = $true)][int]$Index,
     [string]$Dest = '.',
     [string]$OutName = 'download.bin',
-    [int]$Parts = 48,
+    [int]$ChunkMB = 128,
     [string]$Proxy = '',
-    [int]$SubParts = 24,
-    [ValidateSet('parts', 'output')][string]$Sink = 'parts',
+    [int]$SubParts = 16,
+    [ValidateSet('chunks', 'output')][string]$Sink = 'chunks',
     [int]$SampleBytes = 65536,
     [string]$Curl = 'C:\Windows\System32\curl.exe'
 )
 
-# Re-download one range of the file in SubParts parallel sub-chunks, verify samples
-# against the remote object, then either replace part_<Index>.bin or write the bytes
-# straight into the finished file at Index * chunk.
+# Re-download one chunk in SubParts parallel sub-ranges, verify samples against the
+# remote object, then either replace _parts/chunk_<Index>.bin or write those bytes
+# straight into the assembled output at Index * chunkBytes.
 
 $ErrorActionPreference = 'Stop'
-$chunk = [int64]([math]::Floor([double]$TotalSize / $Parts) + 1)
-$start = [int64]$Index * $chunk
-if ($start -ge $TotalSize) { throw "index $Index out of range" }
-$end  = [math]::Min($start + $chunk - 1, $TotalSize - 1)
+$chunkBytes = [int64]$ChunkMB * 1MB
+$start = [int64]$Index * $chunkBytes
+if ($start -ge $TotalSize) { throw "chunk index $Index out of range" }
+$end  = [math]::Min($start + $chunkBytes - 1, $TotalSize - 1)
 $size = [int64]($end - $start + 1)
 
 $PartsDir = Join-Path $Dest '_parts'
@@ -33,7 +33,7 @@ function Write-Log([string]$Message) {
     Add-Content -LiteralPath $Log -Value ('[{0:yyyy-MM-dd HH:mm:ss}] {1}' -f (Get-Date), $Message) -Encoding utf8
 }
 
-Write-Log ("repair part {0}: start={1} size={2} subparts={3} sink={4}" -f $Index, $start, $size, $SubParts, $Sink)
+Write-Log ("repair chunk {0}: start={1} size={2} subs={3} sink={4}" -f $Index, $start, $size, $SubParts, $Sink)
 
 $subSize = [int64]([math]::Floor([double]$size / $SubParts) + 1)
 $subs = @()
@@ -71,8 +71,8 @@ $subs | ForEach-Object -Parallel {
     }
 } -ThrottleLimit $SubParts
 
-$newPart = Join-Path $work 'part.bin'
-$out = [System.IO.File]::Open($newPart, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+$newChunk = Join-Path $work 'chunk.bin'
+$out = [System.IO.File]::Open($newChunk, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
 try {
     foreach ($sub in $subs) {
         $in = [System.IO.File]::OpenRead($sub.File)
@@ -80,11 +80,10 @@ try {
     }
 } finally { $out.Dispose() }
 
-$newSize = (Get-Item -LiteralPath $newPart).Length
-if ($newSize -ne $size) { Write-Log ("FAIL new part size {0} != {1}" -f $newSize, $size); exit 2 }
+$newSize = (Get-Item -LiteralPath $newChunk).Length
+if ($newSize -ne $size) { Write-Log ("FAIL new chunk size {0} != {1}" -f $newSize, $size); exit 2 }
 
-# sample-verify the new bytes against the remote object
-$fs = [System.IO.File]::OpenRead($newPart)
+$fs = [System.IO.File]::OpenRead($newChunk)
 $badSamples = 0
 try {
     foreach ($fraction in @(0.001, 0.2, 0.4, 0.6, 0.8, 0.999)) {
@@ -117,12 +116,12 @@ if ($Sink -eq 'output') {
     $target = Join-Path $Dest $OutName
     if (-not (Test-Path -LiteralPath $target)) { throw "output not found: $target" }
     $dst = [System.IO.File]::Open($target, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write)
-    $src = [System.IO.File]::OpenRead($newPart)
+    $src = [System.IO.File]::OpenRead($newChunk)
     try { $null = $dst.Seek($start, 'Begin'); $src.CopyTo($dst, 4MB) } finally { $src.Dispose(); $dst.Dispose() }
-    Write-Log ("part {0} spliced into {1} at {2}" -f $Index, $OutName, $start)
+    Write-Log ("chunk {0} spliced into {1} at {2}" -f $Index, $OutName, $start)
 } else {
-    Move-Item -LiteralPath $newPart -Destination (Join-Path $PartsDir ('part_{0:D3}.bin' -f $Index)) -Force
-    Write-Log ("part {0} replaced" -f $Index)
+    Move-Item -LiteralPath $newChunk -Destination (Join-Path $PartsDir ('chunk_{0:D5}.bin' -f $Index)) -Force
+    Write-Log ("chunk {0} replaced" -f $Index)
 }
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
